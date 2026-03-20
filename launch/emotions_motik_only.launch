@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<!--
+  Только emotions_display_node (motik), без robot_mouth_talk_node.
+  Удобно для проверки карусели эмоций на OLED без звука и осциллограммы.
+
+  Пример:
+    roslaunch sound_mouth_motik_emotions emotions_motik_only.launch cycle_emotions_demo_sec:=2.5
+-->
+<launch>
+  <arg name="default_emotion" default="neutral"/>
+  <arg name="cycle_emotions_demo_sec" default="2.5" doc="Интервал смены эмоций, сек (0 = без карусели)"/>
+
+  <include file="$(find sound_mouth_motik_emotions)/launch/display_3d.launch">
+    <arg name="launch_mouth" value="false"/>
+    <arg name="default_emotion" value="$(arg default_emotion)"/>
+    <arg name="cycle_emotions_demo_sec" value="$(arg cycle_emotions_demo_sec)"/>
+  </include>
+</launch>
