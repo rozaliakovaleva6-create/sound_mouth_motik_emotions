@@ -49,13 +49,18 @@ def draw_neutral():
 
 
 def draw_happy():
+    """
+    Радость: без глаз; одна дуга-улыбка по вертикальному центру экрана, толще прежней (width=2).
+    Нижняя полуэллипса 0°…180° — классическая «улыбка» внутри ограничивающего прямоугольника.
+    """
     img = Image.new("1", (W, H), 0)
     draw = ImageDraw.Draw(img)
-    draw.arc((16, 10, 52, 46), 0, 360, fill=255, width=2)
-    draw.pieslice((22, 18, 46, 42), 200, 340, fill=255)
-    draw.arc((76, 10, 112, 46), 0, 360, fill=255, width=2)
-    draw.pieslice((82, 18, 106, 42), 200, 340, fill=255)
-    draw.arc((24, 38, 104, 62), 0, 180, fill=255, width=2)
+    cy = H // 2
+    # Было: arc (24,38)-(104,62), центр ~50 по Y. Центрируем по cy≈32, сохраняем ширину ~80, высоту ~24.
+    half_w, half_h = 40, 12
+    x0, y0 = W // 2 - half_w, cy - half_h
+    x1, y1 = W // 2 + half_w, cy + half_h
+    draw.arc((x0, y0, x1, y1), 0, 180, fill=255, width=5)
     return img
 
 
