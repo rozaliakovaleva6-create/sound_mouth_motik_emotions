@@ -77,10 +77,10 @@
 ### 5. Сборка после изменений
 
 ```bash
-cd /home/ubuntu/ros_ws
-source /opt/ros/noetic/setup.bash
-catkin_make
-source devel/setup.bash
+cd ~/ros_ws
+source /opt/ros/noetic/setup.zsh
+sudo catkin build sound_mouth_motik_emotions
+source devel/setup.zsh
 ```
 
 ### 6. Тестирование

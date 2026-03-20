@@ -11,19 +11,27 @@ ROS-нода: эмоции робота (motik) на OLED 0x3D.
 При переключении на "mouth" — очищает дисплей (отдаёт его robot_mouth_talk_node).
 
 Параметры:
-  ~cycle_emotions_demo_sec (float, по умолчанию 0) — если > 0, на дисплее по кругу показываются
-    все эмоции из EMOTION_NAMES_ORDER с этим интервалом (сек), только при active_driver=motik.
-    Поставьте 0, чтобы снова управлять только топиком /emotions.
+  ~cycle_emotions_demo_sec (float, по умолчанию 0) — стартовый интервал карусели (сек); 0 = выкл.
+
+Топик (без перезапуска ноды):
+  /emotions_display/set_cycle_demo_sec (std_msgs/Float32) — задать интервал карусели в рантайме.
+    data <= 0 — выключить карусель, на OLED сразу neutral, дальше только /emotions и переключение mouth/motik.
+    data > 0 — включить карусель с этим интервалом (с начала списка с neutral).
+
+Важно: переключение mouth <-> motik на дисплее работает, только если запущены ОБЕ ноды
+(robot_mouth_talk_node и emotions_display_node). При launch_mouth:=false рот не рисует — экран
+может оставаться пустым после переключения на mouth.
 """
 from __future__ import annotations
 
+import atexit
 import os
 import sys
 import threading
 import time
 
 import rospy
-from std_msgs.msg import String
+from std_msgs.msg import String, Float32
 
 W, H = 128, 64
 
@@ -185,8 +193,15 @@ class EmotionsDisplayNode:
 
         rospy.Subscriber("/emotions", String, self._cb_emotion, queue_size=1)
         rospy.Subscriber("/oled_3d/active__driver", String, self._cb_active_driver, queue_size=1)
+        rospy.Subscriber(
+            "/emotions_display/set_cycle_demo_sec",
+            Float32,
+            self._cb_set_cycle_demo_sec,
+            queue_size=1,
+        )
 
         rospy.on_shutdown(self._on_shutdown)
+        atexit.register(self._shutdown_display_neutral)
 
         # Вывод всех эмоций по очереди в лог (нумерованный список)
         rospy.loginfo("emotions_display_node: зарегистрированные эмоции (порядок карусели):")
@@ -231,6 +246,24 @@ class EmotionsDisplayNode:
                     self._active_driver = val
                     self._dirty = True
 
+    def _cb_set_cycle_demo_sec(self, msg):
+        """Выключение карусели (data<=0) → сразу neutral на дисплее; data>0 — снова карусель."""
+        sec = float(msg.data)
+        with self._lock:
+            if sec <= 0.0:
+                self._cycle_demo_sec = 0.0
+                self._emotion = "neutral"
+                self._dirty = True
+                rospy.loginfo("emotions_display_node: карусель выключена → neutral на OLED")
+            else:
+                self._cycle_demo_sec = sec
+                self._last_cycle_time = time.time()
+                self._cycle_index = 0
+                if self._emotion_cycle:
+                    self._emotion = self._emotion_cycle[0]
+                self._dirty = True
+                rospy.loginfo("emotions_display_node: карусель %.1f с (с %s)", sec, self._emotion)
+
     def _display(self, img):
         if self.device is None:
             return
@@ -240,7 +273,25 @@ class EmotionsDisplayNode:
             rospy.logdebug("emotions_display: %s", e)
 
     def _on_shutdown(self):
-        pass
+        self._shutdown_display_neutral()
+
+    def _shutdown_display_neutral(self):
+        """
+        При выходе (Ctrl+C / kill) не оставлять чёрный экран: если motik владеет OLED — рисуем neutral.
+        Дублируем кадр + пауза для завершения I2C (как у robot_mouth_talk_node).
+        """
+        if self.device is None:
+            return
+        try:
+            # Без lock: избегаем взаимной блокировки с run() при Ctrl+C
+            if getattr(self, "_active_driver", "") != "motik":
+                return
+            img = draw_neutral()
+            self._display(img)
+            time.sleep(0.15)
+            self._display(img)
+        except Exception as e:
+            rospy.logdebug("shutdown_display_neutral: %s", e)
 
     def run(self):
         rate = rospy.Rate(10)

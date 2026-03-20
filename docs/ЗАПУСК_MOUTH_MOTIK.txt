@@ -1,0 +1,173 @@
+================================================================================
+  sound_mouth_motik_emotions — запуск mouth / motik, карусель эмоций, звук
+  Формат: plain text (UTF-8). Пакет: sound_mouth_motik_emotions
+================================================================================
+
+1. ОБЩИЕ УСЛОВИЯ ПЕРЕД ЛЮБЫМИ КОМАНДАМИ
+--------------------------------------------------------------------------------
+  • Должен быть запущен ROS master:
+      roscore
+    (или bringup, если он уже поднимает roscore.)
+
+  • В каждом новом терминале:
+      source /opt/ros/noetic/setup.bash
+      source ~/ros_ws/devel/setup.bash
+    (путь к devel подставьте свой, если отличается.)
+
+  • OLED 3D на I2C 0x3D: одновременно на шину не должны писать посторонние сервисы
+    (конфликт с другим процессом на 0x3D).
+
+
+2. КТО РИСУЕТ НА ЭКРАНЕ 0x3D (mouth ИЛИ motik)
+--------------------------------------------------------------------------------
+  Одновременно картинку на дисплей отдаёт только ОДНА логика:
+    • "mouth"  → нода robot_mouth_talk_node (рот / осциллограмма при воспроизведении)
+    • "motik"  → нода emotions_display_node (эмоции)
+
+  Переключатель (после того как нужные ноды уже запущены):
+    rostopic pub -1 /oled_3d/active__driver std_msgs/String "data: 'mouth'"
+    rostopic pub -1 /oled_3d/active__driver std_msgs/String "data: 'motik'"
+
+  Стартовое значение задаётся параметром (если задан в launch):
+    /oled_3d/active_driver_default
+    По умолчанию в коде нод — "mouth", если параметр не выставлен.
+
+  ВАЖНО:
+    • Переключение mouth ↔ motik имеет смысл, когда ЗАПУЩЕНЫ ОБЕ ноды
+      (полный display_3d.launch с launch_mouth:=true).
+    • Если запущен только motik (launch_mouth:=false), после переключения на
+      "mouth" на экране никто не рисует рот — экран может быть пустым.
+
+
+3. ПОСЛЕДОВАТЕЛЬНОСТЬ ЗАПУСКА (РЕКОМЕНДУЕМЫЙ ПОРЯДОК)
+--------------------------------------------------------------------------------
+  Шаг A. Поднять roscore (если ещё нет).
+
+  Шаг B. Запустить ноды дисплея/звука одним из вариантов из раздела 4.
+
+  Шаг C. Дождаться в логах сообщений о старте нод (и при необходимости —
+         init_pose/init_finish у робота, если ноды ждут подъёма).
+
+  Шаг D. Если подняты ОБЕ ноды и нужен экран рта — убедиться, что активен mouth:
+         rostopic pub -1 /oled_3d/active__driver std_msgs/String "data: 'mouth'"
+
+  Шаг E. Если нужны эмоции на экране — переключить на motik:
+         rostopic pub -1 /oled_3d/active__driver std_msgs/String "data: 'motik'"
+
+  Шаг F. Звук — только при работающей robot_mouth_talk_node и обычно при
+         active_driver=mouth (картинка рта на OLED). См. раздел 6.
+
+  Пауза между шагами: обычно 1–3 секунды после старта launch, пока ноды
+  зарегистрируются в ROS; отдельная команда "sleep" не обязательна.
+
+
+4. ВАРИАНТЫ ЗАПУСКА (LAUNCH)
+--------------------------------------------------------------------------------
+
+  4.1. Полный режим: mouth + motik (переключение топиком)
+  ------------------------------------------------------------
+    roslaunch sound_mouth_motik_emotions display_3d.launch
+
+    Параметры (примеры):
+      output_device:=default          — ALSA для pygame (aplay -l)
+      mouth_sync_hz:=30               — частота обновления рта
+      default_emotion:=neutral        — эмоция по умолчанию у motik
+      cycle_emotions_demo_sec:=0      — 0 = карусель выключена при старте
+      launch_mouth:=true              — по умолчанию; рот запускается
+
+    Условие: нужны и звук/рот, и эмоции на одном роботе с переключением.
+
+  4.2. Только эмоции + карусель (рот НЕ запускается)
+  ------------------------------------------------------------
+    roslaunch sound_mouth_motik_emotions display_3d.launch \
+      launch_mouth:=false cycle_emotions_demo_sec:=2.5
+
+    Или короткий алиас:
+    roslaunch sound_mouth_motik_emotions emotions_motik_only.launch \
+      cycle_emotions_demo_sec:=2.5
+
+    При launch_mouth:=false в launch выставляется:
+      /oled_3d/active_driver_default = motik
+    Экран сразу у эмоций; карусель крутится каждые 2.5 с (или ваш интервал).
+
+    Условие: проверка эмоций без звука и без ноды рта.
+
+  4.3. Обе ноды, но карусель сразу включена
+  ------------------------------------------------------------
+    roslaunch sound_mouth_motik_emotions display_3d.launch \
+      cycle_emotions_demo_sec:=2.5
+
+    На OLED карусель будет видна только когда active_driver=motik:
+    rostopic pub -1 /oled_3d/active__driver std_msgs/String "data: 'motik'"
+
+
+5. КРУГ (КАРУСЕЛЬ) ЭМОЦИЙ
+--------------------------------------------------------------------------------
+  Порядок на дисплее: neutral → happy → sad → cute → smoke (по кругу).
+
+  Включение при старте:
+    параметр ноды emotions_display_node:
+      ~cycle_emotions_demo_sec  > 0   (секунды между сменами)
+
+  Включение / выключение БЕЗ перезапуска ноды:
+    rostopic pub -1 /emotions_display/set_cycle_demo_sec std_msgs/Float32 "data: 2.5"
+    rostopic pub -1 /emotions_display/set_cycle_demo_sec std_msgs/Float32 "data: 0.0"
+
+  Условия:
+    • Карусель крутится только если active_driver == motik.
+    • data > 0  — включить карусель с интервалом data секунд (с начала списка).
+    • data <= 0 — выключить карусель; на экране сразу neutral; дальше эмоции
+                  задаются вручную топиком /emotions.
+
+  Остановка "круга" = публикация 0.0 на set_cycle_demo_sec (см. выше).
+  Это не останавливает ноду и не убивает roslaunch.
+
+
+6. ВОСПРОИЗВЕДЕНИЕ ЗВУКА И ОТМЕНА (СТОП)
+--------------------------------------------------------------------------------
+  Условия:
+    • Должна быть запущена robot_mouth_talk_node (не режим launch_mouth:=false).
+    • Файл: в пакете папка voice/ или полный путь.
+
+  Старт воспроизведения:
+    rosservice call /oled_mouth/play_audio "data: 'имя_файла.mp3'"
+
+  Остановка воспроизведения (и очереди):
+    rosservice call /oled_mouth/play_audio "data: 'stop'"
+
+  Пауза: отдельной команды "пауза" в сервисе нет — используйте stop.
+
+
+7. РУЧНАЯ СМЕНА ЭМОЦИИ (без карусели или вместе с ней до отключения карусели)
+--------------------------------------------------------------------------------
+  Условие: active_driver=motik.
+
+    rostopic pub -1 /oled_3d/active__driver std_msgs/String "data: 'motik'"
+    rostopic pub -1 /emotions std_msgs/String "data: 'neutral'"
+    rostopic pub -1 /emotions std_msgs/String "data: 'happy'"
+    rostopic pub -1 /emotions std_msgs/String "data: 'sad'"
+    rostopic pub -1 /emotions std_msgs/String "data: 'cute'"
+    rostopic pub -1 /emotions std_msgs/String "data: 'smoke'"
+
+
+8. ОСТАНОВКА ROSLAUNCH (Ctrl+C) И ПОВЕДЕНИЕ ЭКРАНА
+--------------------------------------------------------------------------------
+  При завершении emotions_display_node, если активен motik, нода перед выходом
+  отправляет на OLED кадр neutral (чтобы экран не оставался чёрным).
+
+  Полная остановка нод — Ctrl+C в терминале roslaunch.
+
+
+9. КРАТКАЯ ШПАРГАЛКА
+--------------------------------------------------------------------------------
+  roslaunch … display_3d.launch
+  rostopic pub -1 /oled_3d/active__driver … 'mouth' | 'motik'
+  rosservice call /oled_mouth/play_audio "data: 'файл.mp3'"
+  rosservice call /oled_mouth/play_audio "data: 'stop'"
+  rostopic pub -1 /emotions_display/set_cycle_demo_sec … Float32 "data: 0.0"
+  rostopic pub -1 /emotions … 'neutral' | 'happy' | 'sad' | 'cute' | 'smoke'
+
+
+================================================================================
+  Конец файла docs/ЗАПУСК_MOUTH_MOTIK.txt
+================================================================================
