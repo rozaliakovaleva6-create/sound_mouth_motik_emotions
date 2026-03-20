@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<!--
+  Рот с осцилограммой — аудио из топика /oled_mouth/audio_path или сервиса /oled_mouth/play_audio.
+  Запуск: roslaunch ainex_bringup oled_mouth.launch
+  Устройство вывода: roslaunch ainex_bringup oled_mouth.launch output_device:=plughw:2,0
+  Частота обновления рта (Гц) должна совпадать с третьей нодой — задаётся /mouth_sync_hz или arg mouth_sync_hz.
+  Если экран гаснет при запуске: остановите сервис, занимающий дисплей: sudo systemctl stop oled_display.service
+-->
+<launch>
+  <arg name="output_device" default="default" doc="ALSA-устройство для воспроизведения (aplay -l). Например plughw:2,0"/>
+  <arg name="mouth_sync_hz" default="30" doc="Частота (Гц) обновления рта; должна совпадать с третьей нодой (test)"/>
+  <param name="/mouth_sync_hz" value="$(arg mouth_sync_hz)"/>
+  <node name="robot_mouth_talk_node" pkg="sound_mouth_motik_emotions" type="robot_mouth_talk_node.py" output="screen">
+    <param name="output_device" value="$(arg output_device)"/>
+    <param name="rate" value="$(arg mouth_sync_hz)"/>
+    <param name="use_oled" value="true"/>
+    <param name="mode" value="idle"/>
+  </node>
+</launch>

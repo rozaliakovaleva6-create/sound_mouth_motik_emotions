@@ -1,0 +1,17 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>sound_mouth_motik_emotions</name>
+  <version>1.0.0</version>
+  <description>3D дисплей робота: mouth (осциллограмма + звук) и motik (эмоции happy/sad/neutral). Переключение через /oled_3d/active__driver.</description>
+
+  <maintainer email="robot@ainex.local">ainex</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+  <exec_depend>rospy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>ainex_interfaces</exec_depend>
+
+  <export>
+  </export>
+</package>

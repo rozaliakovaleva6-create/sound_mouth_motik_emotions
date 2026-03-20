@@ -1,0 +1,11 @@
+<?xml version="1.0"?>
+<!--
+  Рот с осцилограммой — то же, что oled_mouth.launch (robot_mouth_talk_node).
+  Запуск: roslaunch ainex_bringup oled_mouth02.launch
+
+  Внимание: если работает oled_display.service (дисплей 0x3D), остановите его:
+    sudo systemctl stop oled_display.service
+-->
+<launch>
+  <include file="$(find sound_mouth_motik_emotions)/launch/oled_mouth.launch"/>
+</launch>
