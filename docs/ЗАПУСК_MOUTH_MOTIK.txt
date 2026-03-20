@@ -28,6 +28,10 @@
     rostopic pub -1 /oled_3d/active__driver std_msgs/String "data: 'mouth'"
     rostopic pub -1 /oled_3d/active__driver std_msgs/String "data: 'motik'"
 
+  После mouth → motik: emotions_display_node принудительно ставит эмоцию neutral (не остаётся
+  smoke/«сигарета» из памяти ноды до переключения на mouth). Таймер карусели при этом сдвигается,
+  чтобы neutral не сменился мгновенно следующим кадром карусели.
+
   Стартовое значение задаётся параметром (если задан в launch):
     /oled_3d/active_driver_default
     По умолчанию в коде нод — "mouth", если параметр не выставлен.
@@ -114,7 +118,7 @@
     rostopic pub -1 /emotions_display/set_cycle_demo_sec std_msgs/Float32 "data: 0.0"
 
   Условия:
-    • Карусель крутится только если active_driver == motik.
+    • Карусель крутится только если active_driver == motik. (перешли на motik)
     • data > 0  — включить карусель с интервалом data секунд (с начала списка).
     • data <= 0 — выключить карусель; на экране сразу neutral; дальше эмоции
                   задаются вручную топиком /emotions.
@@ -148,6 +152,36 @@
     rostopic pub -1 /emotions std_msgs/String "data: 'sad'"
     rostopic pub -1 /emotions std_msgs/String "data: 'cute'"
     rostopic pub -1 /emotions std_msgs/String "data: 'smoke'"
+
+
+7.1. БЕЗДЕЙСТВИЕ → ЭМОЦИЯ SMOKE (таймер в emotions_display_node)
+--------------------------------------------------------------------------------
+  ~idle_boot_grace_sec (по умолчанию 60 с): первые N секунд после завершения init emotions_display_node
+  принудительный smoke от бездействия не включается (осциллограмма/рот не перехватываются). После
+  этого действует обычный ~idle_timeout_sec. Задать 0 — без задержки после старта ноды.
+
+  Если ~idle_smoke_enabled=true и ~idle_timeout_sec>0 (по умолчанию 60 с), при отсутствии
+  действий и пока /oled_3d/mouth_playback_active=false, на OLED принудительно motik + smoke.
+
+  «Действие» сбрасывает таймер; если был smoke от бездействия:
+    • rostopic pub … /oled_3d/active__driver … 'mouth' или 'motik' — переключение на выбранный
+      драйвер и стартовый экран (mouth → рот/осциллограмма, motik → neutral).
+    • Пинг от рта без смены драйвера — возврат к драйверу до простоя (как раньше).
+    • /emotions или /emotions_display/set_cycle_demo_sec — сразу выбранная эмоция или карусель,
+      без принудительного neutral между smoke и командой.
+    • play_audio /oled_mouth/audio_path: robot_mouth_talk_node сам шлёт active_driver=mouth,
+      затем очередь и звук — одной командой выход из smoke и воспроизведение.
+
+  Переключатель (тип сообщения именно std_msgs/String):
+    rostopic pub -1 /oled_3d/active__driver std_msgs/String "data: 'mouth'"
+    rostopic pub -1 /oled_3d/active__driver std_msgs/String "data: 'motik'"
+
+  События действия: /emotions, /emotions_display/set_cycle_demo_sec, смена
+  /oled_3d/active__driver (вручную), очередь/стоп play_audio, /oled_mouth/audio_path,
+  /oled_mouth/mode; во время воспроизведения файла mouth_playback_active=true — таймер
+  smoke не срабатывает.
+
+  Отключить поведение: ~idle_timeout_sec:=0 или ~idle_smoke_enabled:=false.
 
 
 8. ОСТАНОВКА ROSLAUNCH (Ctrl+C) И ПОВЕДЕНИЕ ЭКРАНА

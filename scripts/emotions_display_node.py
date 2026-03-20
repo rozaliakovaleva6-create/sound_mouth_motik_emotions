@@ -18,6 +18,18 @@ ROS-нода: эмоции робота (motik) на OLED 0x3D.
     data <= 0 — выключить карусель, на OLED сразу neutral, дальше только /emotions и переключение mouth/motik.
     data > 0 — включить карусель с этим интервалом (с начала списка с neutral).
 
+Бездействие (~idle_timeout_sec, по умолчанию 60 с):
+  Пока нет «действия» и нет воспроизведения звука (см. /oled_3d/mouth_playback_active), на OLED
+  принудительно motik + эмоция smoke. Таймер сбрасывается от активности.
+  Выход из smoke: явная смена /oled_3d/active__driver — стартовый экран выбранного драйвера
+  (mouth → рот/осциллограмма, motik → neutral). Пинг от рта без смены драйвера — возврат как
+  до простоя. Команда /emotions или карусель во время smoke — сразу выбранная эмоция/карусель,
+  без принудительного neutral.
+
+~idle_boot_grace_sec (по умолчанию 60 с): первые N секунд после завершения инициализации ноды
+  принудительный smoke от бездействия не включается (осциллограмма не перехватывается). Дальше
+  действует только idle_timeout_sec. Задать 0 — без задержки (как при отсутствии этого параметра).
+
 Важно: переключение mouth <-> motik на дисплее работает, только если запущены ОБЕ ноды
 (robot_mouth_talk_node и emotions_display_node). При launch_mouth:=false рот не рисует — экран
 может оставаться пустым после переключения на mouth.
@@ -31,7 +43,7 @@ import threading
 import time
 
 import rospy
-from std_msgs.msg import String, Float32
+from std_msgs.msg import String, Float32, Empty
 
 W, H = 128, 64
 
@@ -189,8 +201,19 @@ class EmotionsDisplayNode:
         self._cycle_index = 0
         self._last_cycle_time = time.time()
 
+        # Таймер бездействия → smoke; восстановление mouth / motik+neutral
+        self._idle_timeout_sec = float(rospy.get_param("~idle_timeout_sec", 60.0))
+        self._idle_boot_grace_sec = float(rospy.get_param("~idle_boot_grace_sec", 60.0))
+        self._idle_smoke_enabled = bool(rospy.get_param("~idle_smoke_enabled", True))
+        self._in_idle_smoke = False
+        self._restore_driver_after_idle = "motik"
+        self._driver_change_internal = False
+        self._pub_user_activity = rospy.Publisher("/oled_3d/user_activity", Empty, queue_size=2, latch=False)
+        self._pub_active_driver = rospy.Publisher("/oled_3d/active__driver", String, queue_size=1, latch=False)
+
         self._init_display()
 
+        rospy.Subscriber("/oled_3d/user_activity", Empty, self._cb_user_activity, queue_size=10)
         rospy.Subscriber("/emotions", String, self._cb_emotion, queue_size=1)
         rospy.Subscriber("/oled_3d/active__driver", String, self._cb_active_driver, queue_size=1)
         rospy.Subscriber(
@@ -199,6 +222,11 @@ class EmotionsDisplayNode:
             self._cb_set_cycle_demo_sec,
             queue_size=1,
         )
+
+        # Отсчёт «после включения»: от конца init (после ожидания standup и подписок)
+        t0 = time.time()
+        self._boot_mono = time.monotonic()
+        self._last_activity = t0
 
         rospy.on_shutdown(self._on_shutdown)
         atexit.register(self._shutdown_display_neutral)
@@ -218,6 +246,78 @@ class EmotionsDisplayNode:
                 " → ".join(self._emotion_cycle),
             )
         rospy.loginfo("emotions_display_node: запущен, эмоция=%s, active_driver=%s", self._emotion, self._active_driver)
+        if self._idle_smoke_enabled and self._idle_timeout_sec > 0:
+            rospy.loginfo(
+                "emotions_display_node: бездействие %.0f с → smoke (не раньше %.0f с после старта ноды); активность → восстановление",
+                self._idle_timeout_sec,
+                self._idle_boot_grace_sec,
+            )
+
+    def _emit_user_activity(self):
+        """Сообщить всем (и mouth), что было действие пользователя."""
+        try:
+            self._pub_user_activity.publish(Empty())
+        except Exception:
+            pass
+
+    def _register_user_activity(self, restore_motik_neutral=True, driver_override=None):
+        """
+        Обновить таймер; если был smoke от бездействия — выйти из него.
+        restore_motik_neutral=False — не затирать эмоцию (уже выставлены /emotions или карусель).
+        driver_override — 'mouth'|'motik': при выходе из smoke принудительно этот драйвер
+        (явная команда /oled_3d/active__driver или запрос воспроизведения от рта).
+        """
+        if not self._idle_smoke_enabled or self._idle_timeout_sec <= 0.0:
+            return
+        self._last_activity = time.time()
+        if self._in_idle_smoke:
+            self._exit_idle_smoke(
+                restore_motik_neutral=restore_motik_neutral,
+                driver_override=driver_override,
+            )
+
+    def _cb_user_activity(self, _msg):
+        """События от robot_mouth_talk_node (звук, очередь, режим)."""
+        self._register_user_activity()
+
+    def _exit_idle_smoke(self, restore_motik_neutral=True, driver_override=None):
+        """Выйти из idle-smoke: драйвер из driver_override, иначе как до простоя; опционально neutral на motik."""
+        rd = (driver_override or self._restore_driver_after_idle or "motik").strip().lower()
+        if rd not in ("mouth", "motik"):
+            rd = "motik"
+        self._driver_change_internal = True
+        try:
+            self._pub_active_driver.publish(String(data=rd))
+        except Exception:
+            pass
+        with self._lock:
+            self._in_idle_smoke = False
+            self._active_driver = rd
+            if restore_motik_neutral and rd == "motik":
+                self._emotion = "neutral"
+            self._dirty = True
+        rospy.loginfo("emotions_display_node: конец бездействия → '%s'", rd)
+
+    def _enter_idle_smoke(self):
+        """Принудительно motik + smoke; запомнить текущий active_driver."""
+        with self._lock:
+            if self._in_idle_smoke:
+                return
+            self._restore_driver_after_idle = self._active_driver
+            self._in_idle_smoke = True
+            self._active_driver = "motik"
+            self._emotion = "smoke"
+            self._dirty = True
+        self._driver_change_internal = True
+        try:
+            self._pub_active_driver.publish(String(data="motik"))
+        except Exception:
+            pass
+        rospy.loginfo(
+            "emotions_display_node: бездействие %.0f с → smoke (было: %s)",
+            self._idle_timeout_sec,
+            self._restore_driver_after_idle,
+        )
 
     def _init_display(self):
         if not LUMA_AVAILABLE:
@@ -232,19 +332,36 @@ class EmotionsDisplayNode:
 
     def _cb_emotion(self, msg):
         val = (msg.data or "").strip().lower()
-        if val in EMOTION_DRAWERS:
-            with self._lock:
-                if self._emotion != val:
-                    self._emotion = val
-                    self._dirty = True
+        if val not in EMOTION_DRAWERS:
+            return
+        with self._lock:
+            self._emotion = val
+            self._dirty = True
+        self._register_user_activity(restore_motik_neutral=False)
+        self._emit_user_activity()
 
     def _cb_active_driver(self, msg):
         val = (msg.data or "").strip().lower()
-        if val:
-            with self._lock:
-                if self._active_driver != val:
-                    self._active_driver = val
-                    self._dirty = True
+        if val not in ("mouth", "motik"):
+            return
+        internal = self._driver_change_internal
+        self._driver_change_internal = False
+        with self._lock:
+            in_smoke = self._in_idle_smoke
+            if self._active_driver != val:
+                self._active_driver = val
+                self._dirty = True
+                # После mouth на OLED в памяти ноды мог остаться smoke (idle или /emotions) —
+                # при явном переходе на motik показываем стартовый neutral, не сигарету.
+                if val == "motik" and not internal:
+                    self._emotion = "neutral"
+                    self._last_cycle_time = time.time()
+        if not internal:
+            # Явное переключение во время smoke — драйвер из команды + стартовый экран (neutral / рот)
+            self._register_user_activity(
+                restore_motik_neutral=True,
+                driver_override=(val if in_smoke else None),
+            )
 
     def _cb_set_cycle_demo_sec(self, msg):
         """Выключение карусели (data<=0) → сразу neutral на дисплее; data>0 — снова карусель."""
@@ -263,6 +380,8 @@ class EmotionsDisplayNode:
                     self._emotion = self._emotion_cycle[0]
                 self._dirty = True
                 rospy.loginfo("emotions_display_node: карусель %.1f с (с %s)", sec, self._emotion)
+        self._register_user_activity(restore_motik_neutral=False)
+        self._emit_user_activity()
 
     def _display(self, img):
         if self.device is None:
@@ -297,9 +416,29 @@ class EmotionsDisplayNode:
         rate = rospy.Rate(10)
         while not rospy.is_shutdown():
             now = time.time()
+            mono = time.monotonic()
+            boot_ok = self._idle_boot_grace_sec <= 0.0 or (
+                (mono - self._boot_mono) >= self._idle_boot_grace_sec
+            )
+            mouth_busy = bool(rospy.get_param("/oled_3d/mouth_playback_active", False))
+            if (
+                self._idle_smoke_enabled
+                and self._idle_timeout_sec > 0.0
+                and not mouth_busy
+                and boot_ok
+            ):
+                with self._lock:
+                    should_smoke = (
+                        not self._in_idle_smoke
+                        and (now - self._last_activity) >= self._idle_timeout_sec
+                    )
+                if should_smoke:
+                    self._enter_idle_smoke()
+
             with self._lock:
                 if (
-                    self._cycle_demo_sec > 0.0
+                    not self._in_idle_smoke
+                    and self._cycle_demo_sec > 0.0
                     and self._emotion_cycle
                     and self._active_driver == "motik"
                     and (now - self._last_cycle_time) >= self._cycle_demo_sec

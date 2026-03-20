@@ -40,7 +40,7 @@ except Exception as e:
     print("Ошибка pygame:", e, file=sys.stderr)
 
 import rospy
-from std_msgs.msg import String, Float32
+from std_msgs.msg import String, Float32, Empty
 from ainex_interfaces.srv import SetString, SetStringResponse
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -476,6 +476,8 @@ class RobotMouthTalkNode:
         rospy.Subscriber("/oled_mouth/mode", String, self._cb_mode, queue_size=1)
         rospy.Subscriber("/audio/mouth_open_level", Float32, self._cb_mouth_open_level, queue_size=5)
         self._pub_playback_level = rospy.Publisher("/audio/playback_level", Float32, queue_size=5)
+        self._pub_user_activity = rospy.Publisher("/oled_3d/user_activity", Empty, queue_size=10, latch=False)
+        self._pub_active_driver = rospy.Publisher("/oled_3d/active__driver", String, queue_size=1, latch=False)
         self.srv = rospy.Service("/oled_mouth/play_audio", SetString, self._srv_play_audio)
 
         rospy.on_shutdown(self._shutdown_display)  # при остановке ноды — финальный кадр, экран не гаснет
@@ -485,6 +487,23 @@ class RobotMouthTalkNode:
             self._output_device,
             self._mouth_update_hz,
         )
+
+    def _ping_user_activity(self):
+        """Сброс таймера бездействия (эмоции → smoke) для ноды emotions_display_node."""
+        try:
+            self._pub_user_activity.publish(Empty())
+        except Exception:
+            pass
+
+    def _request_mouth_driver_for_playback(self):
+        """
+        После idle-smoke OLED у motik: переключаем на mouth до пинга активности, чтобы одной
+        командой play выйти из smoke и сразу отдать дисплей рту (осциллограмма + звук).
+        """
+        try:
+            self._pub_active_driver.publish(String(data="mouth"))
+        except Exception:
+            pass
 
     def _cb_active_driver(self, msg):
         val = (msg.data or "").strip().lower()
@@ -513,13 +532,16 @@ class RobotMouthTalkNode:
     def _cb_audio_path(self, msg):
         path = (msg.data or "").strip()
         if path:
+            self._request_mouth_driver_for_playback()
             with self.lock:
                 self.play_queue.append(path)
+            self._ping_user_activity()
 
     def _cb_mode(self, msg):
         m = (msg.data or "").strip().lower()
         if m in ("idle", "oscillogram"):
             self.mode = m
+            self._ping_user_activity()
 
     def _cb_mouth_open_level(self, msg):
         """Уровень открытия рта от цепочки нод (третья нода): осциллограмма с динамика/микрофона."""
@@ -554,11 +576,14 @@ class RobotMouthTalkNode:
                         self._current_play_proc.terminate()
                 except Exception:
                     pass
+            self._ping_user_activity()
             return SetStringResponse(success=True, message="stopped")
 
-        with self.lock:
-            if data:
+        if data:
+            self._request_mouth_driver_for_playback()
+            with self.lock:
                 self.play_queue.append(data)
+        self._ping_user_activity()
         return SetStringResponse(success=True, message="queued" if data else "empty")
 
     def _display(self, img):
@@ -589,151 +614,159 @@ class RobotMouthTalkNode:
         if not resolved:
             rospy.logwarn("Аудио не найдено: %s", audio_path)
             return
-        wav_samples, wav_sr, duration_sec = load_wav_for_rms(resolved)
-        # Pygame mixer инициализируется на 44100 — выравниваем огибающую по времени воспроизведения
-        mixer_sr = 44100
-        peak_abs, rms_ref = 1.0, 1.0
-        if wav_samples is not None and wav_sr > 0:
-            wav_samples, wav_sr = _resample_linear(wav_samples, wav_sr, mixer_sr)
-            duration_sec = len(wav_samples) / float(wav_sr)
-            peak_abs = float(np.max(np.abs(wav_samples))) + 1e-9
-            rms_ref = float(np.sqrt(np.mean(np.asarray(wav_samples, dtype=np.float64) ** 2))) + 1e-9
-        elif not HAS_NUMPY:
-            rospy.logwarn(
-                "Осциллограмма по файлу недоступна: установите numpy (pip3 install numpy)"
-            )
-        else:
-            rospy.logwarn(
-                "Не удалось загрузить сэмплы для RMS (%s). Осциллограмма будет глухой. "
-                "Установите: pip3 install soundfile pydub && sudo apt install ffmpeg",
-                os.path.basename(resolved),
-            )
-
-        play_proc = None
-        audio_ok = False
-        use_subprocess = False
-        self._current_play_proc = None
-        self._current_use_subprocess = False
-
-        if _init_mixer(self._output_device):
-            try:
-                pygame.mixer.music.load(resolved)
-                pygame.mixer.music.play()
-                audio_ok = True
-            except pygame.error as e:
-                rospy.logwarn("pygame: %s", e)
-
-        if not audio_ok:
-            play_proc = _play_via_alsa(resolved, self._output_device)
-            if play_proc and play_proc.poll() is None:
-                use_subprocess, audio_ok = True, True
-                self._current_play_proc = play_proc
-                self._current_use_subprocess = use_subprocess
-
-        if not audio_ok:
-            rospy.logwarn("Звук не запущен. Имитация %s с.", IMITATE_ONLY_DURATION_SEC)
-
-        # Старт с «спокойного рта» — совпадает с draw_idle_mouth / NORMAL_MOUTH_OPEN, без скачка первого кадра
-        mouth_open = float(NORMAL_MOUTH_OPEN)
-        start_time = time.time()
-        duration_ms = int(duration_sec * 1000) if duration_sec > 0 else 0
-        min_anim_sec = 0.3
-        has_waveform = (
-            wav_samples is not None
-            and wav_sr > 0
-            and duration_sec > 0
-            and len(wav_samples) > 0
-        )
-        # Хвост после длительности файла (мс → сек): дорисовываем кадр, пока буфер ALSA догрызает
-        timeline_tail_sec = 0.4
-
-        while rospy.is_shutdown() is False:
-            if self._stop_requested.is_set():
-                break
-            elapsed = time.time() - start_time
-            elapsed_ms = int(elapsed * 1000)
-
-            if use_subprocess and play_proc:
-                is_playing_audio = play_proc.poll() is None and (
-                    duration_ms == 0 or elapsed_ms < duration_ms
+        try:
+            rospy.set_param("/oled_3d/mouth_playback_active", True)
+            wav_samples, wav_sr, duration_sec = load_wav_for_rms(resolved)
+            # Pygame mixer инициализируется на 44100 — выравниваем огибающую по времени воспроизведения
+            mixer_sr = 44100
+            peak_abs, rms_ref = 1.0, 1.0
+            if wav_samples is not None and wav_sr > 0:
+                wav_samples, wav_sr = _resample_linear(wav_samples, wav_sr, mixer_sr)
+                duration_sec = len(wav_samples) / float(wav_sr)
+                peak_abs = float(np.max(np.abs(wav_samples))) + 1e-9
+                rms_ref = float(np.sqrt(np.mean(np.asarray(wav_samples, dtype=np.float64) ** 2))) + 1e-9
+            elif not HAS_NUMPY:
+                rospy.logwarn(
+                    "Осциллограмма по файлу недоступна: установите numpy (pip3 install numpy)"
                 )
             else:
-                is_playing_audio = (
-                    pygame.mixer.music.get_busy() if pygame.mixer.get_init() else False
+                rospy.logwarn(
+                    "Не удалось загрузить сэмплы для RMS (%s). Осциллограмма будет глухой. "
+                    "Установите: pip3 install soundfile pydub && sudo apt install ffmpeg",
+                    os.path.basename(resolved),
                 )
 
-            # Критично: на части железа get_busy() почти сразу False, хотя звук идёт —
-            # тогда огибающая не обновлялась. Если есть декодированный файл — крутим осциллограмму
-            # по таймкоду файла, а не только по get_busy().
-            if has_waveform:
-                in_timeline = elapsed < (duration_sec + timeline_tail_sec)
-                show_scope = in_timeline
-            else:
-                show_scope = is_playing_audio
+            play_proc = None
+            audio_ok = False
+            use_subprocess = False
+            self._current_play_proc = None
+            self._current_use_subprocess = False
 
-            target = 0.0
-            if show_scope and has_waveform:
-                pos_ms = min(duration_sec * 1000.0, max(0.0, elapsed * 1000.0))
-                raw_level = _playback_level_from_samples(
-                    wav_samples, wav_sr, pos_ms, peak_abs, rms_ref
-                )
-                self._pub_playback_level.publish(Float32(data=raw_level))
-                target = raw_level
-            elif show_scope:
-                target = NORMAL_MOUTH_OPEN
-                self._pub_playback_level.publish(Float32(data=target))
+            if _init_mixer(self._output_device):
+                try:
+                    pygame.mixer.music.load(resolved)
+                    pygame.mixer.music.play()
+                    audio_ok = True
+                except pygame.error as e:
+                    rospy.logwarn("pygame: %s", e)
 
-            smooth = (
-                self._mouth_smooth_playback
-                if (show_scope and has_waveform)
-                else MOUTH_SMOOTH
+            if not audio_ok:
+                play_proc = _play_via_alsa(resolved, self._output_device)
+                if play_proc and play_proc.poll() is None:
+                    use_subprocess, audio_ok = True, True
+                    self._current_play_proc = play_proc
+                    self._current_use_subprocess = use_subprocess
+
+            if not audio_ok:
+                rospy.logwarn("Звук не запущен. Имитация %s с.", IMITATE_ONLY_DURATION_SEC)
+
+            # Старт с «спокойного рта» — совпадает с draw_idle_mouth / NORMAL_MOUTH_OPEN, без скачка первого кадра
+            mouth_open = float(NORMAL_MOUTH_OPEN)
+            start_time = time.time()
+            duration_ms = int(duration_sec * 1000) if duration_sec > 0 else 0
+            min_anim_sec = 0.3
+            has_waveform = (
+                wav_samples is not None
+                and wav_sr > 0
+                and duration_sec > 0
+                and len(wav_samples) > 0
             )
-            mouth_open += (target - mouth_open) * (1.0 - smooth)
-            mouth_open = max(0.0, min(1.0, mouth_open))
+            # Хвост после длительности файла (мс → сек): дорисовываем кадр, пока буфер ALSA догрызает
+            timeline_tail_sec = 0.4
 
-            if show_scope and has_waveform:
-                frame = draw_oscilloscope_frame(
-                    mouth_open, elapsed, sin_freq_hz=self._osc_sin_freq
-                )
-            elif show_scope:
-                frame = draw_mouth_mode7(mouth_open)
-            else:
-                frame = draw_idle_mouth()
+            while rospy.is_shutdown() is False:
+                if self._stop_requested.is_set():
+                    break
+                elapsed = time.time() - start_time
+                elapsed_ms = int(elapsed * 1000)
 
-            self._display(frame)
-            time.sleep(1.0 / FPS)
-
-            # Выход: при наличии волны — строго по длине файла (+хвост)
-            if has_waveform and elapsed >= duration_sec + timeline_tail_sec:
-                break
-            if not has_waveform:
                 if use_subprocess and play_proc:
-                    if elapsed >= min_anim_sec and (
-                        play_proc.poll() is not None
-                        or (duration_ms > 0 and elapsed_ms >= duration_ms)
-                    ):
-                        break
-                elif not is_playing_audio and audio_ok and elapsed > max(1.0, min_anim_sec):
-                    break
-                elif not audio_ok and elapsed >= IMITATE_ONLY_DURATION_SEC:
-                    break
+                    is_playing_audio = play_proc.poll() is None and (
+                        duration_ms == 0 or elapsed_ms < duration_ms
+                    )
+                else:
+                    is_playing_audio = (
+                        pygame.mixer.music.get_busy() if pygame.mixer.get_init() else False
+                    )
 
-        if use_subprocess and play_proc and play_proc.poll() is None:
-            play_proc.terminate()
-        if pygame.mixer.get_init() and audio_ok and not use_subprocess:
+                # Критично: на части железа get_busy() почти сразу False, хотя звук идёт —
+                # тогда огибающая не обновлялась. Если есть декодированный файл — крутим осциллограмму
+                # по таймкоду файла, а не только по get_busy().
+                if has_waveform:
+                    in_timeline = elapsed < (duration_sec + timeline_tail_sec)
+                    show_scope = in_timeline
+                else:
+                    show_scope = is_playing_audio
+
+                target = 0.0
+                if show_scope and has_waveform:
+                    pos_ms = min(duration_sec * 1000.0, max(0.0, elapsed * 1000.0))
+                    raw_level = _playback_level_from_samples(
+                        wav_samples, wav_sr, pos_ms, peak_abs, rms_ref
+                    )
+                    self._pub_playback_level.publish(Float32(data=raw_level))
+                    target = raw_level
+                elif show_scope:
+                    target = NORMAL_MOUTH_OPEN
+                    self._pub_playback_level.publish(Float32(data=target))
+
+                smooth = (
+                    self._mouth_smooth_playback
+                    if (show_scope and has_waveform)
+                    else MOUTH_SMOOTH
+                )
+                mouth_open += (target - mouth_open) * (1.0 - smooth)
+                mouth_open = max(0.0, min(1.0, mouth_open))
+
+                if show_scope and has_waveform:
+                    frame = draw_oscilloscope_frame(
+                        mouth_open, elapsed, sin_freq_hz=self._osc_sin_freq
+                    )
+                elif show_scope:
+                    frame = draw_mouth_mode7(mouth_open)
+                else:
+                    frame = draw_idle_mouth()
+
+                self._display(frame)
+                time.sleep(1.0 / FPS)
+
+                # Выход: при наличии волны — строго по длине файла (+хвост)
+                if has_waveform and elapsed >= duration_sec + timeline_tail_sec:
+                    break
+                if not has_waveform:
+                    if use_subprocess and play_proc:
+                        if elapsed >= min_anim_sec and (
+                            play_proc.poll() is not None
+                            or (duration_ms > 0 and elapsed_ms >= duration_ms)
+                        ):
+                            break
+                    elif not is_playing_audio and audio_ok and elapsed > max(1.0, min_anim_sec):
+                        break
+                    elif not audio_ok and elapsed >= IMITATE_ONLY_DURATION_SEC:
+                        break
+
+            if use_subprocess and play_proc and play_proc.poll() is None:
+                play_proc.terminate()
+            if pygame.mixer.get_init() and audio_ok and not use_subprocess:
+                try:
+                    pygame.mixer.music.stop()
+                except Exception:
+                    pass
+
+            self._current_play_proc = None
+            self._current_use_subprocess = False
+        finally:
             try:
-                pygame.mixer.music.stop()
+                rospy.set_param("/oled_3d/mouth_playback_active", False)
             except Exception:
                 pass
-
-        # Очистка текущих ссылок
-        self._current_play_proc = None
-        self._current_use_subprocess = False
 
         # После остановки/окончания — возврат к статичному рту обработает run()
 
     def run(self):
         self._display(draw_idle_mouth())
+        # Первый кадр на OLED — сброс таймера бездействия в emotions_display_node
+        self._ping_user_activity()
         # В rospy нет spin_once(); колбэки обрабатываем в отдельном потоке
         spin_thread = threading.Thread(target=rospy.spin, daemon=True)
         spin_thread.start()
