@@ -5,12 +5,21 @@ ROS-нода: рот с осциллограммой. Аудио приходи�
 
 Топики:
   /oled_mouth/audio_path (std_msgs/String) — путь к файлу или имя — воспроизвести и показать осцилограмму
+  /oled_mouth/stop_audio (std_msgs/Empty) — стоп воспроизведения и очереди (как play_audio stop); из любого терминала,
+    в отличие от Ctrl+C (см. ниже).
   /oled_mouth/mode      (std_msgs/String) — режим: "idle" (статичный рот), "oscillogram" (по умолчанию при воспроизведении)
   /audio/mouth_open_level (std_msgs/Float32) — уровень открытия рта 0..1 от третьей ноды.
   /audio/playback_level (std_msgs/Float32) — публикуется нодой рта во время воспроизведения: уровень 0..1 из воспроизводимого файла (сигнал на карту); третья нода использует его вместо микрофона.
 
 Сервисы:
   /oled_mouth/play_audio (ainex_interfaces/SetString) — data = путь или имя файла — воспроизвести
+    data = stop|halt|q|quit — остановить очередь и текущее воспроизведение
+    суффикс ::block у имени файла — ответ сервиса только после окончания этого трека (или стопа), см. play_audio_wait.py
+
+Ctrl+C (SIGINT) в процесс этой ноды: 1-й раз — стоп звука и очереди (как play_audio stop);
+  2-й раз в течение ~2 с — выход ноды. Работает и под roslaunch (без отдельного rosrun).
+  Важно: Ctrl+C в терминале, где только rosservice call, процессу ноды не доставляется (SIGINT идёт в foreground
+  shell). Стоп оттуда: rosservice … stop, или одна публикация: rostopic pub -1 /oled_mouth/stop_audio std_msgs/Empty
 
 Вывод пикселей на дисплей 0x3D отключён в комментариях — дисплей использует motik (топик emotions).
 
@@ -26,6 +35,7 @@ from __future__ import annotations
 import atexit
 import math
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -69,6 +79,15 @@ OSC_SIN_FREQ_HZ = 3.5
 MOUTH_SYNC_TIMEOUT_SEC = 0.5
 # Частота обновления рта (Гц) — должна совпадать с частотой публикации третьей ноды (/mouth_sync_hz или ~rate)
 DEFAULT_MOUTH_UPDATE_HZ = 30.0
+
+
+def _oled_3d_i2c_address():
+    """Глобальный параметр /oled_3d/i2c_address — 7-битный адрес SSD1306 (по умолчанию 0x3D=61)."""
+    v = rospy.get_param("/oled_3d/i2c_address", 0x3D)
+    if isinstance(v, str):
+        return int(v.strip(), 0)
+    return int(v)
+
 
 try:
     from luma.core.interface.serial import i2c
@@ -444,8 +463,11 @@ class RobotMouthTalkNode:
         rospy.init_node("robot_mouth_talk_node", anonymous=False)
         _wait_for_robot_standup()
         self.device = None
-        self.play_queue = []
+        self.play_queue = []  # элементы: (path: str, service_blocks: bool)
         self.lock = threading.Lock()
+        self._srv_block_done = threading.Event()
+        self._srv_block_waiting = False
+        self._srv_block_interrupted = False
         self.mode = rospy.get_param("~mode", "oscillogram")
         # Если true — рисуем анимацию/рот на OLED I2C 0x3D.
         # Важно: дисплеем может владеть только один процесс одновременно.
@@ -473,6 +495,7 @@ class RobotMouthTalkNode:
         self._init_display()
 
         rospy.Subscriber("/oled_mouth/audio_path", String, self._cb_audio_path, queue_size=1)
+        rospy.Subscriber("/oled_mouth/stop_audio", Empty, self._cb_stop_audio, queue_size=3)
         rospy.Subscriber("/oled_mouth/mode", String, self._cb_mode, queue_size=1)
         rospy.Subscriber("/audio/mouth_open_level", Float32, self._cb_mouth_open_level, queue_size=5)
         self._pub_playback_level = rospy.Publisher("/audio/playback_level", Float32, queue_size=5)
@@ -483,10 +506,82 @@ class RobotMouthTalkNode:
         rospy.on_shutdown(self._shutdown_display)  # при остановке ноды — финальный кадр, экран не гаснет
         atexit.register(self._shutdown_display)   # дублируем на случай выхода без rospy (kill, исключение)
         rospy.loginfo(
-            "robot_mouth_talk_node: /oled_mouth/play_audio, звук: %s, обновление: %.1f Гц",
+            "robot_mouth_talk_node: /oled_mouth/play_audio, /oled_mouth/stop_audio, звук: %s, обновление: %.1f Гц",
             self._output_device,
             self._mouth_update_hz,
         )
+        self._install_sigint_stop_audio()
+
+    def _install_sigint_stop_audio(self):
+        """1-й SIGINT — stop_audio_playback(); 2-й за ~2 с — rospy.signal_shutdown. Всегда (в т.ч. roslaunch)."""
+        self._sigint_count = 0
+        self._sigint_timer = None
+        self._sigint_lock = threading.Lock()
+        reset_delay = 2.0
+
+        def reset_count():
+            with self._sigint_lock:
+                self._sigint_count = 0
+
+        def schedule_reset():
+            t = getattr(self, "_sigint_timer", None)
+            if t is not None:
+                try:
+                    t.cancel()
+                except Exception:
+                    pass
+            self._sigint_timer = threading.Timer(reset_delay, reset_count)
+            self._sigint_timer.daemon = True
+            self._sigint_timer.start()
+
+        def handler(signum, frame):
+            with self._sigint_lock:
+                self._sigint_count += 1
+                n = self._sigint_count
+            if n == 1:
+                try:
+                    self.stop_audio_playback()
+                except Exception as ex:
+                    rospy.logwarn("robot_mouth_talk_node: Ctrl+C stop: %s", ex)
+                rospy.loginfo(
+                    "robot_mouth_talk_node: Ctrl+C (SIGINT) — воспроизведение остановлено "
+                    "(как play_audio stop). Повторите Ctrl+C в течение ~2 с для выхода из ноды."
+                )
+                schedule_reset()
+            else:
+                rospy.signal_shutdown("sigint")
+
+        signal.signal(signal.SIGINT, handler)
+        if sys.stdin.isatty():
+            rospy.loginfo("robot_mouth_talk_node: SIGINT — стоп звука / повторный — выход (интерактивный терминал).")
+        else:
+            rospy.loginfo(
+                "robot_mouth_talk_node: SIGINT — стоп звука / повторный — выход (в т.ч. roslaunch: Ctrl+C в окне launch)."
+            )
+
+    def stop_audio_playback(self):
+        """Очистить очередь и остановить текущий трек (аналог сервиса data='stop')."""
+        with self.lock:
+            self.play_queue[:] = []
+        if getattr(self, "_srv_block_waiting", False):
+            self._srv_block_interrupted = True
+        try:
+            self._srv_block_done.set()
+        except Exception:
+            pass
+        self._stop_requested.set()
+        try:
+            if pygame.mixer.get_init():
+                pygame.mixer.music.stop()
+        except Exception:
+            pass
+        if self._current_use_subprocess and self._current_play_proc is not None:
+            try:
+                if self._current_play_proc.poll() is None:
+                    self._current_play_proc.terminate()
+            except Exception:
+                pass
+        self._ping_user_activity()
 
     def _ping_user_activity(self):
         """Сброс таймера бездействия (эмоции → smoke) для ноды emotions_display_node."""
@@ -517,16 +612,18 @@ class RobotMouthTalkNode:
         if not LUMA_AVAILABLE:
             rospy.logerr("robot_mouth_talk_node: для вывода на OLED установите: pip3 install luma.oled pillow")
             return
+        addr = _oled_3d_i2c_address()
         try:
-            serial = i2c(port=1, address=0x3D)
+            serial = i2c(port=1, address=addr)
             self.device = ssd1306(serial, width=W, height=H)
             try:
                 if self._active_driver == "mouth":
                     self.device.display(draw_idle_mouth())
             except Exception:
                 pass
+            rospy.loginfo("robot_mouth_talk_node: OLED 3D I2C адрес %#x", addr)
         except Exception as e:
-            rospy.logerr("robot_mouth_talk_node: дисплей I2C 0x3D недоступен: %s", e)
+            rospy.logerr("robot_mouth_talk_node: дисплей I2C %#x недоступен: %s", addr, e)
             self.device = None
 
     def _cb_audio_path(self, msg):
@@ -534,8 +631,13 @@ class RobotMouthTalkNode:
         if path:
             self._request_mouth_driver_for_playback()
             with self.lock:
-                self.play_queue.append(path)
+                self.play_queue.append((path, False))
             self._ping_user_activity()
+
+    def _cb_stop_audio(self, _msg):
+        """Топик — стоп из любого терминала (аналог сервиса play_audio stop)."""
+        self.stop_audio_playback()
+        rospy.loginfo("robot_mouth_talk_node: /oled_mouth/stop_audio — воспроизведение остановлено")
 
     def _cb_mode(self, msg):
         m = (msg.data or "").strip().lower()
@@ -561,30 +663,43 @@ class RobotMouthTalkNode:
     def _srv_play_audio(self, req):
         data = (req.data or "").strip()
         if data.lower() in ("stop", "halt", "q", "quit"):
-            with self.lock:
-                self.play_queue[:] = []
-            self._stop_requested.set()
-            # Пытаемся остановить воспроизведение сразу
-            try:
-                if pygame.mixer.get_init():
-                    pygame.mixer.music.stop()
-            except Exception:
-                pass
-            if self._current_use_subprocess and self._current_play_proc is not None:
-                try:
-                    if self._current_play_proc.poll() is None:
-                        self._current_play_proc.terminate()
-                except Exception:
-                    pass
-            self._ping_user_activity()
+            self.stop_audio_playback()
             return SetStringResponse(success=True, message="stopped")
 
-        if data:
-            self._request_mouth_driver_for_playback()
-            with self.lock:
-                self.play_queue.append(data)
+        if not data:
+            self._ping_user_activity()
+            return SetStringResponse(success=True, message="empty")
+
+        block = False
+        path = data
+        low = data.lower()
+        if low.endswith("::block"):
+            block = True
+            path = data[: -len("::block")].rstrip()
+            if not path:
+                return SetStringResponse(success=False, message="empty_path_with_block")
+
+        self._request_mouth_driver_for_playback()
+        if block:
+            self._srv_block_interrupted = False
+            self._srv_block_done.clear()
+            self._srv_block_waiting = True
+        with self.lock:
+            self.play_queue.append((path, block))
         self._ping_user_activity()
-        return SetStringResponse(success=True, message="queued" if data else "empty")
+
+        if block:
+            try:
+                while not rospy.is_shutdown():
+                    if self._srv_block_done.wait(0.1):
+                        break
+            finally:
+                self._srv_block_waiting = False
+                self._srv_block_done.clear()
+            msg = "interrupted" if self._srv_block_interrupted else "finished"
+            return SetStringResponse(success=True, message=msg)
+
+        return SetStringResponse(success=True, message="queued")
 
     def _display(self, img):
         if self.device is None:
@@ -772,12 +887,23 @@ class RobotMouthTalkNode:
         spin_thread.start()
         rate = rospy.Rate(self._mouth_update_hz)
         while not rospy.is_shutdown():
-            path = None
+            item = None
             with self.lock:
                 if self.play_queue:
-                    path = self.play_queue.pop(0)
-            if path:
-                self._play_and_animate(path)
+                    item = self.play_queue.pop(0)
+            if item:
+                if isinstance(item, tuple):
+                    path, block_svc = item[0], item[1]
+                else:
+                    path, block_svc = item, False
+                try:
+                    self._play_and_animate(path)
+                finally:
+                    if block_svc:
+                        try:
+                            self._srv_block_done.set()
+                        except Exception:
+                            pass
                 self._display(draw_idle_mouth())
             else:
                 if self.mode == "idle":

@@ -28,13 +28,36 @@
     rostopic pub -1 /oled_3d/active__driver std_msgs/String "data: 'mouth'"
     rostopic pub -1 /oled_3d/active__driver std_msgs/String "data: 'motik'"
 
+  Стартовое значение драйвера задаётся параметром (если задан в launch):
+    /oled_3d/active_driver_default
+    По умолчанию в коде нод — "mouth", если параметр не выставлен.
+
+  I2C-адрес OLED для рта/motik (если «лицо» не на 0x3D — см. п. 2.1):
+    аргумент bringup: oled_3d_i2c_address (61 = 0x3D, 60 = 0x3C), пишет /oled_3d/i2c_address.
+
   После mouth → motik: emotions_display_node принудительно ставит эмоцию neutral (не остаётся
   smoke/«сигарета» из памяти ноды до переключения на mouth). Таймер карусели при этом сдвигается,
   чтобы neutral не сменился мгновенно следующим кадром карусели.
 
-  Стартовое значение задаётся параметром (если задан в launch):
-    /oled_3d/active_driver_default
-    По умолчанию в коде нод — "mouth", если параметр не выставлен.
+2.1. НА «3D» ЭКРАНЕ SSID, IP, CPU (системная инфо) ВМЕСТО РТА
+--------------------------------------------------------------------------------
+  Эту картинку рисует systemd-сервис ainex_bringup: scripts/oled_display.py на адрес I2C 0x3C.
+  Ноды robot_mouth_talk_node / emotions_display_node по умолчанию пишут на 0x3D. Если физически
+  «лицевой» модуль сидит на шине как 0x3C, на нём и остаётся инфо, а рот уходит на другой чип.
+
+  Что сделать:
+    1) Проверка:  sudo i2cdetect -y 1   — какие адреса 3c / 3d видны.
+
+    2) Перевести рот/motik на тот же адрес, где «лицо» (часто 60 = 0x3C):
+         roslaunch ainex_bringup bringup.launch oled_3d_i2c_address:=60
+       (или в своём launch задать /oled_3d/i2c_address до старта нод.)
+
+    3) Убрать конкуренцию с oled_display на ОДНОМ чипе — один из вариантов:
+         • Два OLED: перенести системную инфо на второй (обычно 0x3D). В unit-файле
+           oled_display.service раскомментировать и применить:
+             Environment=OLED_INFO_I2C_ADDRESS=0x3D
+           затем: sudo systemctl daemon-reload && sudo systemctl restart oled_display.service
+         • Один OLED только под рот:  sudo systemctl disable --now oled_display.service
 
   ВАЖНО:
     • Переключение mouth ↔ motik имеет смысл, когда ЗАПУЩЕНЫ ОБЕ ноды
@@ -117,14 +140,28 @@
     rostopic pub -1 /emotions_display/set_cycle_demo_sec std_msgs/Float32 "data: 2.5"
     rostopic pub -1 /emotions_display/set_cycle_demo_sec std_msgs/Float32 "data: 0.0"
 
+  Один терминал: карусель крутится, пока не Ctrl+C (в этом же окне — стоп круга, публикация 0.0):
+    # только интервал (motik должны включить сами, если нужен экран эмоций)
+    rosrun sound_mouth_motik_emotions emotion_cycle_wait.py 2.5
+
+    # с переключением на motik за вас
+    rosrun sound_mouth_motik_emotions emotion_cycle_wait.py --motik 2.5
+
+    rostopic pub -1 … завершается сразу — Ctrl+C в том же терминале потом не к чему привязать;
+    для сессии «старт + стоп по Ctrl+C» используйте emotion_cycle_wait.py.
+
   Условия:
     • Карусель крутится только если active_driver == motik. (перешли на motik)
     • data > 0  — включить карусель с интервалом data секунд (с начала списка).
     • data <= 0 — выключить карусель; на экране сразу neutral; дальше эмоции
                   задаются вручную топиком /emotions.
 
-  Остановка "круга" = публикация 0.0 на set_cycle_demo_sec (см. выше).
-  Это не останавливает ноду и не убивает roslaunch.
+  Остановка "круга" = публикация 0.0 на set_cycle_demo_sec (см. выше) или Ctrl+C в процессе
+  emotion_cycle_wait.py. Это не останавливает ноду и не убивает roslaunch.
+
+  Если emotions_display_node в TTY (rosrun): первый Ctrl+C — выключить карусель в ноде; второй
+  за ~2 с — выход из ноды. Под roslaunch без TTY удобнее гасить круг через emotion_cycle_wait.py
+  (Ctrl+C там) или rostopic pub … 0.0.
 
 
 6. ВОСПРОИЗВЕДЕНИЕ ЗВУКА И ОТМЕНА (СТОП)
@@ -136,8 +173,35 @@
   Старт воспроизведения:
     rosservice call /oled_mouth/play_audio "data: 'имя_файла.mp3'"
 
-  Остановка воспроизведения (и очереди):
     rosservice call /oled_mouth/play_audio "data: 'stop'"
+
+  Ожидание до конца трека в одном процессе (РЕКОМЕНДУЕТСЯ: Ctrl+C → стоп в этом же терминале):
+    rosrun sound_mouth_motik_emotions play_audio_wait.py имя_файла.mp3
+    (внутри вызывается play_audio с суффиксом ::block; Ctrl+C шлёт /oled_mouth/stop_audio.)
+
+  Альтернатива без Python (оболочка: Ctrl+C → stop_audio + прерывание клиента rosservice):
+    rosrun sound_mouth_motik_emotions oled_play_block.bash имя_файла.mp3
+    (без символа одинарной кавычки в имени; для сложных имён — play_audio_wait.py.)
+
+  Режим ::block через сырой rosservice (ответ после окончания звука или стопа):
+    rosservice call /oled_mouth/play_audio "data: 'имя_файла.mp3::block'"
+  ВАЖНО: во время такого вызова клиент rosservice часто «зависает» на сокете и Ctrl+C
+  может не сработать до конца трека. Для прерывания из этого же окна используйте
+  play_audio_wait.py или oled_play_block.bash; иначе стоп из другого терминала:
+  rosservice … "data: 'stop'" или rostopic pub … /oled_mouth/stop_audio.
+
+
+  То же из любого терминала (удобно, если звук запускали rosservice call из другого окна):
+    rostopic pub -1 /oled_mouth/stop_audio std_msgs/Empty
+
+  Ctrl+C (SIGINT) и нода robot_mouth_talk_node: первый сигнал — то же, что stop (очередь + текущий
+  трек); второй в течение ~2 с — выход из ноды. Работает и при запуске через roslaunch: нажимайте
+  Ctrl+C в том же терминале, где запущен roslaunch (сигнал доходит до дочернего процесса ноды).
+  Отдельный rosrun для рта не нужен.
+
+  Важно: Ctrl+C в окне с обычным (неблокирующим) rosservice call — стоп ноде не уходит;
+  для стопа: rosservice … "data: 'stop'" или rostopic pub … /oled_mouth/stop_audio.
+  Для rosservice … "::block" см. предупреждение выше (лучше play_audio_wait / oled_play_block).
 
   Пауза: отдельной команды "пауза" в сервисе нет — используйте stop.
 

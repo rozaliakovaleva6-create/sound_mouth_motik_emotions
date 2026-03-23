@@ -18,6 +18,12 @@ ROS-нода: эмоции робота (motik) на OLED 0x3D.
     data <= 0 — выключить карусель, на OLED сразу neutral, дальше только /emotions и переключение mouth/motik.
     data > 0 — включить карусель с этим интервалом (с начала списка с neutral).
 
+  Удобный клиент с Ctrl+C в том же терминале (процесс «держит» карусель, пока не остановите):
+    rosrun sound_mouth_motik_emotions emotion_cycle_wait.py [--motik] <секунды>
+
+  В интерактивном терминале (прямой rosrun этой ноды): первый Ctrl+C — выключить карусель (как data<=0),
+  если она была включена; второй Ctrl+C подряд (~2 с) — выход из ноды. При roslaunch без TTY поведение не меняется.
+
 Бездействие (~idle_timeout_sec, по умолчанию 60 с):
   Пока нет «действия» и нет воспроизведения звука (см. /oled_3d/mouth_playback_active), на OLED
   принудительно motik + эмоция smoke. Таймер сбрасывается от активности.
@@ -38,6 +44,7 @@ from __future__ import annotations
 
 import atexit
 import os
+import signal
 import sys
 import threading
 import time
@@ -185,6 +192,14 @@ def _wait_for_robot_standup(timeout=30):
     return False
 
 
+def _oled_3d_i2c_address():
+    """Параметр /oled_3d/i2c_address — 7-битный адрес OLED «3D» (по умолчанию 0x3D=61)."""
+    v = rospy.get_param("/oled_3d/i2c_address", 0x3D)
+    if isinstance(v, str):
+        return int(v.strip(), 0)
+    return int(v)
+
+
 class EmotionsDisplayNode:
     def __init__(self):
         rospy.init_node("emotions_display_node", anonymous=False)
@@ -252,6 +267,63 @@ class EmotionsDisplayNode:
                 self._idle_timeout_sec,
                 self._idle_boot_grace_sec,
             )
+        self._install_tty_sigint_disable_carousel()
+
+    def _disable_carousel_ctrl_c(self):
+        """Выключить карусель как при set_cycle_demo_sec <= 0 (только если была включена)."""
+        with self._lock:
+            if self._cycle_demo_sec <= 0.0:
+                return False
+            self._cycle_demo_sec = 0.0
+            self._emotion = "neutral"
+            self._dirty = True
+        rospy.loginfo("emotions_display_node: карусель выключена (Ctrl+C) → neutral на OLED")
+        self._register_user_activity(restore_motik_neutral=False)
+        self._emit_user_activity()
+        return True
+
+    def _install_tty_sigint_disable_carousel(self):
+        """В TTY: 1-й Ctrl+C — стоп карусели; 2-й — выход (без TTY не вмешиваемся в SIGINT)."""
+        if not sys.stdin.isatty():
+            return
+        self._sigint_count = 0
+        self._sigint_timer = None
+        self._sigint_lock = threading.Lock()
+        reset_delay = 2.0
+
+        def reset_count():
+            with self._sigint_lock:
+                self._sigint_count = 0
+
+        def schedule_reset():
+            t = getattr(self, "_sigint_timer", None)
+            if t is not None:
+                try:
+                    t.cancel()
+                except Exception:
+                    pass
+            self._sigint_timer = threading.Timer(reset_delay, reset_count)
+            self._sigint_timer.daemon = True
+            self._sigint_timer.start()
+
+        def handler(signum, frame):
+            with self._sigint_lock:
+                self._sigint_count += 1
+                n = self._sigint_count
+            if n == 1:
+                try:
+                    self._disable_carousel_ctrl_c()
+                except Exception as ex:
+                    rospy.logwarn("emotions_display_node: Ctrl+C: %s", ex)
+                rospy.loginfo(
+                    "emotions_display_node: Ctrl+C — карусель сброшена (если была включена). "
+                    "Повторите Ctrl+C для выхода из ноды."
+                )
+                schedule_reset()
+            else:
+                rospy.signal_shutdown("sigint")
+
+        signal.signal(signal.SIGINT, handler)
 
     def _emit_user_activity(self):
         """Сообщить всем (и mouth), что было действие пользователя."""
@@ -323,11 +395,13 @@ class EmotionsDisplayNode:
         if not LUMA_AVAILABLE:
             rospy.logerr("emotions_display_node: pip3 install luma.oled pillow")
             return
+        addr = _oled_3d_i2c_address()
         try:
-            serial = i2c(port=1, address=0x3D)
+            serial = i2c(port=1, address=addr)
             self.device = ssd1306(serial, width=W, height=H)
+            rospy.loginfo("emotions_display_node: OLED 3D I2C адрес %#x", addr)
         except Exception as e:
-            rospy.logerr("emotions_display_node: дисплей 0x3D недоступен: %s", e)
+            rospy.logerr("emotions_display_node: дисплей %#x недоступен: %s", addr, e)
             self.device = None
 
     def _cb_emotion(self, msg):

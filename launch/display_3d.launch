@@ -33,6 +33,9 @@
   <!-- 0 = только /emotions; &gt;0 = карусель всех эмоций на OLED (сек на кадр), нужен motik -->
   <arg name="cycle_emotions_demo_sec" default="0" doc="Демо: смена эмоций по кругу, сек (0=выкл)"/>
   <arg name="launch_mouth" default="true" doc="false = не запускать robot_mouth_talk_node (только эмоции)"/>
+  <!-- I2C 7-bit адрес OLED «3D»: 61=0x3D (типично), 60=0x3C если на этом модуле был oled_display (SSID/IP) -->
+  <arg name="oled_3d_i2c_address" default="61" doc="61=0x3D, 60=0x3C"/>
+  <param name="/oled_3d/i2c_address" value="$(arg oled_3d_i2c_address)"/>
 
   <param name="/mouth_sync_hz" value="$(arg mouth_sync_hz)"/>
 
