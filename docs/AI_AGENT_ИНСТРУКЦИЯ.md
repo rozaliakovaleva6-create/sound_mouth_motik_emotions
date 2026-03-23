@@ -5,7 +5,7 @@
 Это ROS-пакет `sound_mouth_motik_emotions` для управления 3D дисплеем (OLED 0x3D) робота AINEX. Пакет содержит две ноды:
 
 1. **robot_mouth_talk_node** (mouth) — осциллограмма + воспроизведение звука
-2. **emotions_display_node** (motik) — эмоции (happy/sad/neutral/cute/smoke) на дисплее
+2. **emotions_display_node** (motik) — эмоции (happy/sad/neutral/cute/cat/smoke) на дисплее
 
 ## Архитектура
 
@@ -36,7 +36,7 @@
 - `/oled_mouth/mode` (String) — `"idle"` / `"oscillogram"`
 - `/audio/mouth_open_level` (Float32) — уровень открытия рта 0..1 (вход)
 - `/audio/playback_level` (Float32) — уровень воспроизведения 0..1 (выход)
-- `/emotions` (String) — `"happy"` / `"sad"` / `"neutral"` / `"cute"` / `"smoke"`
+- `/emotions` (String) — `"happy"` / `"sad"` / `"neutral"` / `"cute"` / `"cat"` / `"smoke"`
 
 **Сервисы:**
 - `/oled_mouth/play_audio` (ainex_interfaces/SetString) — воспроизвести файл или `"stop"`

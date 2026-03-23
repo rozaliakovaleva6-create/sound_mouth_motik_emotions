@@ -130,7 +130,7 @@
 
 5. КРУГ (КАРУСЕЛЬ) ЭМОЦИЙ
 --------------------------------------------------------------------------------
-  Порядок на дисплее: neutral → happy → sad → cute → smoke (по кругу).
+  Порядок на дисплее: neutral → happy → sad → cute → cat → smoke (по кругу).
 
   Включение при старте:
     параметр ноды emotions_display_node:
@@ -215,6 +215,7 @@
     rostopic pub -1 /emotions std_msgs/String "data: 'happy'"
     rostopic pub -1 /emotions std_msgs/String "data: 'sad'"
     rostopic pub -1 /emotions std_msgs/String "data: 'cute'"
+    rostopic pub -1 /emotions std_msgs/String "data: 'cat'"
     rostopic pub -1 /emotions std_msgs/String "data: 'smoke'"
 
 
@@ -263,7 +264,7 @@
   rosservice call /oled_mouth/play_audio "data: 'файл.mp3'"
   rosservice call /oled_mouth/play_audio "data: 'stop'"
   rostopic pub -1 /emotions_display/set_cycle_demo_sec … Float32 "data: 0.0"
-  rostopic pub -1 /emotions … 'neutral' | 'happy' | 'sad' | 'cute' | 'smoke'
+  rostopic pub -1 /emotions … 'neutral' | 'happy' | 'sad' | 'cute' | 'cat' | 'smoke'
 
 
 ================================================================================

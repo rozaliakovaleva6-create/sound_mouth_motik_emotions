@@ -9,6 +9,9 @@
 Условия (как у ноды emotions_display_node):
   • Должна быть запущена emotions_display_node.
   • Карусель на дисплее только при active_driver=motik (опция --motik переключает сама).
+  • Анимация «сигареты» на OLED — в emotions_display_node: сигарета неподвижна; два шлейфа дыма
+    ползут змейкой вдоль волнистых путей и поочерёдно обновляются (smoke в карусели, /emotions,
+    бездействие ~60 с); ~smoke_anim_enabled, ~smoke_anim_frame_sec.
 
 Примеры:
   rosrun sound_mouth_motik_emotions emotion_cycle_wait.py 2.5

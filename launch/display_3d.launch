@@ -25,11 +25,12 @@
     rostopic pub -1 /emotions std_msgs/String "data: 'happy'"
     rostopic pub -1 /emotions std_msgs/String "data: 'sad'"
     rostopic pub -1 /emotions std_msgs/String "data: 'neutral'"
+    rostopic pub -1 /emotions std_msgs/String "data: 'cat'"
 -->
 <launch>
   <arg name="output_device" default="default" doc="ALSA-устройство (aplay -l)"/>
   <arg name="mouth_sync_hz" default="30" doc="Частота обновления рта (Гц)"/>
-  <arg name="default_emotion" default="neutral" doc="Эмоция по умолчанию: happy, sad, neutral"/>
+  <arg name="default_emotion" default="neutral" doc="Эмоция по умолчанию: neutral, happy, sad, cute, cat, smoke"/>
   <!-- 0 = только /emotions; &gt;0 = карусель всех эмоций на OLED (сек на кадр), нужен motik -->
   <arg name="cycle_emotions_demo_sec" default="0" doc="Демо: смена эмоций по кругу, сек (0=выкл)"/>
   <arg name="launch_mouth" default="true" doc="false = не запускать robot_mouth_talk_node (только эмоции)"/>

@@ -4,7 +4,7 @@
 ROS-нода: эмоции робота (motik) на OLED 0x3D.
 
 Топики:
-  /emotions (std_msgs/String) — эмоция: "happy", "sad", "neutral", "cute", "smoke"
+  /emotions (std_msgs/String) — эмоция: "happy", "sad", "neutral", "cute", "cat", "smoke"
   /oled_3d/active__driver (std_msgs/String) — переключатель: "motik" или "mouth"
 
 Рисует только когда active_driver == "motik".
@@ -12,6 +12,10 @@ ROS-нода: эмоции робота (motik) на OLED 0x3D.
 
 Параметры:
   ~cycle_emotions_demo_sec (float, по умолчанию 0) — стартовый интервал карусели (сек); 0 = выкл.
+  ~smoke_anim_enabled (bool, по умолчанию true) — анимация дыма у эмоции smoke (карусель, /emotions, бездействие).
+  ~smoke_anim_frame_sec (float, по умолчанию 0.18) — шаг анимации дыма (сек): две «змейки» ползут по путям.
+  ~cat_anim_enabled (bool, по умолчанию true) — чередование кадров «cat» (усы чуть вниз).
+  ~cat_anim_frame_sec (float, по умолчанию 0.45) — длительность одного кадра cat (сек); цикл 2 кадра.
 
 Топик (без перезапуска ноды):
   /emotions_display/set_cycle_demo_sec (std_msgs/Float32) — задать интервал карусели в рантайме.
@@ -140,26 +144,153 @@ def draw_cute():
     return img
 
 
-def draw_smoke():
+def draw_cat_animated(mono: float, frame_sec: float):
     """
-    Стилизованная сигарета с дымом: овал на «типе», две параллельные линии корпуса, волнистый дым вверх.
+    Кошачья мордочка: нос (перевёрнутый треугольник) + 6 усов.
+    Кадр 0 — старт (усы «нейтральнее»); кадр 1 — конец: кончики усов ниже (иллюзия шевеления).
+    Один нос (треугольник сверху), без отдельного «рта» под ним. Цикл 0↔1.
     """
     img = Image.new("1", (W, H), 0)
     draw = ImageDraw.Draw(img)
     lw = 2
-    # Кончик / тлеющий край (слева внизу)
-    draw.ellipse((16, 46, 28, 56), outline=255, width=lw)
-    # Корпус — две параллельные линии под углом вправо-вверх
-    draw.line((26, 50, 92, 42), fill=255, width=lw)
-    draw.line((26, 54, 94, 46), fill=255, width=lw)
-    # Короткая «окантовка» у фильтра
-    draw.line((88, 40, 88, 48), fill=255, width=lw)
-    # Дым — две волнистые линии от кончика
-    smoke1 = [(24, 46), (18, 38), (22, 30), (16, 22), (20, 14), (14, 8), (18, 4)]
-    smoke2 = [(28, 44), (32, 34), (26, 26), (30, 18), (24, 10), (28, 5)]
-    draw.line(smoke1, fill=255, width=lw)
-    draw.line(smoke2, fill=255, width=lw)
+    fs = max(frame_sec, 0.05)
+    phase = int(mono / fs) % 2
+
+    # Нос: скруглённый перевёрнутый треугольник (широкий верх, острие вниз)
+    draw.polygon([(59, 29), (69, 29), (64, 37)], fill=255, outline=255)
+
+    # Базы усов у щёк (фиксированы)
+    left_base = [(51, 31), (50, 34), (51, 37)]
+    right_base = [(77, 31), (78, 34), (77, 37)]
+
+    if phase == 0:
+        # Стартовый кадр: усы чуть «вверх / в сторону»
+        left_tip = [(22, 25), (18, 34), (22, 41)]
+        right_tip = [(106, 25), (110, 34), (106, 41)]
+    else:
+        # Конечный кадр: только усы опущены вниз (без второго треугольника/рта под носом)
+        left_tip = [(24, 29), (19, 40), (24, 47)]
+        right_tip = [(104, 29), (109, 40), (104, 47)]
+
+    for b, t in zip(left_base, left_tip):
+        draw.line([b, t], fill=255, width=lw)
+    for b, t in zip(right_base, right_tip):
+        draw.line([b, t], fill=255, width=lw)
+
     return img
+
+
+def draw_cat():
+    """Первый кадр эмоции cat (без тика времени)."""
+    return draw_cat_animated(0.0, 0.45)
+
+
+# --- Дым: две волнистые «змейки» (длинная + короткая), ползут вдоль пути и по очереди обновляются.
+# Сигарета рисуется ОДИН раз в фиксированных координатах (капсула с тлеющим концом).
+SMOKE_LONG_PATH = [
+    (27, 48),
+    (24, 44),
+    (26, 40),
+    (23, 36),
+    (26, 32),
+    (22, 28),
+    (25, 24),
+    (21, 20),
+    (24, 16),
+    (20, 12),
+    (23, 8),
+    (19, 5),
+    (22, 2),
+]
+SMOKE_SHORT_PATH = [
+    (31, 47),
+    (33, 42),
+    (30, 38),
+    (32, 33),
+    (29, 29),
+    (31, 25),
+    (28, 21),
+    (30, 17),
+]
+SMOKE_LONG_VISIBLE = 7
+SMOKE_SHORT_VISIBLE = 5
+SMOKE_SNAKE_PAUSE_STEPS = 3
+# Сдвиг фазы второго шлейфа (тиков): пока одна змейка «уходит», другая как бы подхватывает
+SMOKE_SHORT_TICK_STAGGER = 7
+
+
+def _draw_cigarette_static(draw, lw=2):
+    """
+    Неподвижная сигарета: капсула (толстый штрих с круглыми концами в Pillow) + тлеющий край + черта у границы.
+    Координаты зафиксированы — не зависят от кадра дыма.
+    """
+    # Тело — наклон ~18° вверх вправо (левый конец ниже = тлеющий)
+    draw.line([(28, 52), (90, 41)], fill=255, width=5)
+    draw.ellipse((23, 48, 33, 55), outline=255, width=lw)
+    draw.line([(31, 49), (31, 53)], fill=255, width=1)
+
+
+def _smoke_snake_segment(path, tick, L_visible, pause_steps):
+    """
+    Один шаг анимации для одной полилинии: нарастание от кончика → скольжение окна L_visible вверх → пауза.
+    Возвращает список точек для draw.line или None в фазе паузы.
+    """
+    n = len(path)
+    if n < 2:
+        return None
+    L = min(L_visible, n)
+    grow_steps = max(0, L - 2) + 1 if L >= 2 else 1
+    slide_max = max(1, n - L + 1)
+    cycle = grow_steps + slide_max + pause_steps
+    step = tick % cycle
+    if step < grow_steps:
+        k = min(L, 2 + step)
+        if k < 2:
+            return None
+        return path[0:k]
+    if step < grow_steps + slide_max:
+        s0 = step - grow_steps
+        return path[s0 : s0 + L]
+    return None
+
+
+def draw_smoke_animated(mono: float, frame_sec: float):
+    """
+    Сигарета неподвижна. Два шлейфа дыма (длинный S-образный и короткий) — каждый ползёт «змейкой»
+    вдоль своего пути (скользящее окно вершин), затем пауза и снова нарастание с кончика.
+    Второй шлейф со сдвигом фазы, чтобы линии визуально поочерёдно сменяли друг друга.
+    Эмоция smoke и бездействие (idle → smoke) используют одну и ту же отрисовку.
+    """
+    img = Image.new("1", (W, H), 0)
+    draw = ImageDraw.Draw(img)
+    lw = 2
+    fs = max(frame_sec, 0.05)
+    tick = int(mono / fs)
+
+    _draw_cigarette_static(draw, lw=lw)
+    if tick % 3 != 1:
+        draw.point((25, 51), fill=255)
+        draw.point((27, 52), fill=255)
+
+    seg_long = _smoke_snake_segment(
+        SMOKE_LONG_PATH, tick, SMOKE_LONG_VISIBLE, SMOKE_SNAKE_PAUSE_STEPS
+    )
+    if seg_long is not None and len(seg_long) >= 2:
+        draw.line(seg_long, fill=255, width=lw)
+
+    tick_short = tick + SMOKE_SHORT_TICK_STAGGER
+    seg_short = _smoke_snake_segment(
+        SMOKE_SHORT_PATH, tick_short, SMOKE_SHORT_VISIBLE, SMOKE_SNAKE_PAUSE_STEPS
+    )
+    if seg_short is not None and len(seg_short) >= 2:
+        draw.line(seg_short, fill=255, width=lw)
+
+    return img
+
+
+def draw_smoke():
+    """Статичный момент цикла (начало змеек у кончика) для совместимости."""
+    return draw_smoke_animated(0.0, 0.18)
 
 
 EMOTION_DRAWERS = {
@@ -167,12 +298,13 @@ EMOTION_DRAWERS = {
     "happy": draw_happy,
     "sad": draw_sad,
     "cute": draw_cute,
+    "cat": draw_cat,
     "smoke": draw_smoke,
 }
 
 # Порядок показа при демо-карусели и для вывода списка в лог
 EMOTION_NAMES_ORDER = tuple(
-    k for k in ("neutral", "happy", "sad", "cute", "smoke") if k in EMOTION_DRAWERS
+    k for k in ("neutral", "happy", "sad", "cute", "cat", "smoke") if k in EMOTION_DRAWERS
 )
 if not EMOTION_NAMES_ORDER:
     EMOTION_NAMES_ORDER = tuple(sorted(EMOTION_DRAWERS.keys()))
@@ -220,6 +352,14 @@ class EmotionsDisplayNode:
         self._idle_timeout_sec = float(rospy.get_param("~idle_timeout_sec", 60.0))
         self._idle_boot_grace_sec = float(rospy.get_param("~idle_boot_grace_sec", 60.0))
         self._idle_smoke_enabled = bool(rospy.get_param("~idle_smoke_enabled", True))
+        self._smoke_anim_enabled = bool(rospy.get_param("~smoke_anim_enabled", True))
+        self._smoke_frame_sec = float(rospy.get_param("~smoke_anim_frame_sec", 0.18))
+        if self._smoke_frame_sec < 0.05:
+            self._smoke_frame_sec = 0.05
+        self._cat_anim_enabled = bool(rospy.get_param("~cat_anim_enabled", True))
+        self._cat_frame_sec = float(rospy.get_param("~cat_anim_frame_sec", 0.45))
+        if self._cat_frame_sec < 0.08:
+            self._cat_frame_sec = 0.08
         self._in_idle_smoke = False
         self._restore_driver_after_idle = "motik"
         self._driver_change_internal = False
@@ -528,7 +668,22 @@ class EmotionsDisplayNode:
                 dirty = self._dirty
                 self._dirty = False
 
-            if driver == "motik" and dirty:
+            # Дым: непрерывная анимация (эмоция smoke, в т.ч. карусель и idle-smoke)
+            smoke_anim = (
+                driver == "motik"
+                and emotion == "smoke"
+                and self._smoke_anim_enabled
+            )
+            cat_anim = (
+                driver == "motik"
+                and emotion == "cat"
+                and self._cat_anim_enabled
+            )
+            if smoke_anim:
+                self._display(draw_smoke_animated(mono, self._smoke_frame_sec))
+            elif cat_anim:
+                self._display(draw_cat_animated(mono, self._cat_frame_sec))
+            elif driver == "motik" and dirty:
                 drawer = EMOTION_DRAWERS.get(emotion, draw_neutral)
                 self._display(drawer())
 
